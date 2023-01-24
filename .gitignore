@@ -32,3 +32,6 @@ borg.exe
 .coverage.*
 .vagrant
 .eggs
+
+.direnv/
+result
