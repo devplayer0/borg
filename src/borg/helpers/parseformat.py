@@ -627,6 +627,12 @@ def archivename_validator(text):
     )
     return validate_text(text)
 
+lv_name_re = re.compile(r'(\S+)/(\S+)$')
+def lv_validator(text):
+    m = lv_name_re.match(text)
+    if not m:
+        raise argparse.ArgumentTypeError(f'Invalid LV name "{text}"')
+    return m.group(1), m.group(2)
 
 class BaseFormatter:
     FIXED_KEYS = {
