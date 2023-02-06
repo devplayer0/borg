@@ -1670,6 +1670,7 @@ class ThinObjectProcessors:
         cache,
         add_item,
         process_file_chunks,
+        chunk_size,
         show_progress,
         log_json,
         iec,
@@ -1682,6 +1683,7 @@ class ThinObjectProcessors:
         self.show_progress = show_progress
         self.print_file_status = file_status_printer or (lambda *args: None)
 
+        self.chunker = ChunkerFixed(chunk_size, sparse=True)
         self.stats = Statistics(output_json=log_json, iec=iec)  # threading: done by cache (including progress)
 
     @classmethod
@@ -1709,11 +1711,10 @@ class ThinObjectProcessors:
             # account for hole at the end
             yield (i, total_chunks - i, 'hole')
 
-    @classmethod
-    def delta_chunkify(cls, *, fd, chunker, total_chunks, delta, old_chunks):
-        chunkmap = list(cls._chunkmap_for_delta(total_chunks=total_chunks, delta=delta))
-        fmap = [(start*chunker.block_size, length*chunker.block_size, t == 'new') for start, length, t in chunkmap]
-        real_chunk_iter = chunker.chunkify(fh=fd, fmap=fmap)
+    def delta_chunkify(self, *, fd, total_chunks, delta, old_chunks):
+        chunkmap = list(self._chunkmap_for_delta(total_chunks=total_chunks, delta=delta))
+        fmap = [(start*self.chunker.block_size, length*self.chunker.block_size, t == 'new') for start, length, t in chunkmap]
+        real_chunk_iter = self.chunker.chunkify(fh=fd, fmap=fmap)
         for (start, length, t) in chunkmap:
             for i in range(length):
                 real_chunk = next(real_chunk_iter)
@@ -1811,12 +1812,12 @@ class ThinObjectProcessors:
             raise BackupError(f'{lv_qual} is not a thin LV')
 
         pool_info = lvm.get_lvs(uuid=info['pool_lv_uuid'])[0]
+        assert lvm.get_size(pool_info, 'chunk_size') == self.chunker.block_size
         meta_info = lvm.get_lvs(uuid=pool_info['metadata_lv_uuid'])[0]
-        chunker = ChunkerFixed(lvm.get_size(pool_info, 'chunk_size'), sparse=True)
 
         with self.next_snap(vg=vg, lv=lv) as nextsnap_info:
             nextsnap_size = lvm.get_size(nextsnap_info, 'lv_size')
-            assert nextsnap_size % chunker.block_size == 0
+            assert nextsnap_size % self.chunker.block_size == 0
 
             with lvm.meta_snapshot(pool_info['lv_dm_path'] + '-tpool'):
                 with OsOpen(path=nextsnap_info['lv_path'], flags=flags_special_follow) as fd:
@@ -1840,8 +1841,8 @@ class ThinObjectProcessors:
                             status = 'M'
 
                         chunk_iter = self.delta_chunkify(
-                            fd=fd, chunker=chunker,
-                            total_chunks=nextsnap_size // chunker.block_size, delta=delta, old_chunks=old_chunks)
+                            fd=fd, total_chunks=nextsnap_size // self.chunker.block_size,
+                            delta=delta, old_chunks=old_chunks)
 
                         self.print_file_status(status, lv_qual)
                         self.stats.files_stats[status] += 1

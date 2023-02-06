@@ -11,6 +11,7 @@ from ..helpers import archivename_validator, comment_validator, lv_validator
 from ..helpers import timestamp, archive_ts_now
 from ..helpers import basic_json_data, json_print
 from ..helpers import log_multi
+from ..helpers import lvm
 from ..helpers import sig_int
 from ..manifest import Manifest
 
@@ -27,6 +28,27 @@ class ThinMixIn:
         self.output_filter = args.output_filter
         self.output_list = args.output_list
 
+        chunk_size = None
+        checked_pools = set()
+        for vg, lv in args.lvs:
+            lvs = lvm.get_lvs(f'{vg}/{lv}')
+            if not lvs:
+                self.print_warning('%s/%s: LV not found')
+                continue
+            if lvs[0]['pool_lv_uuid'] in checked_pools:
+                continue
+
+            pool_info = lvm.get_lvs(uuid=lvs[0]['pool_lv_uuid'])[0]
+            pool_chunk_size = lvm.get_size(pool_info, 'chunk_size')
+            if chunk_size is None:
+                chunk_size = pool_chunk_size
+            elif pool_chunk_size != chunk_size:
+                self.print_error('Not all thin LV chunk sizes match!')
+                return self.exit_code
+        if chunk_size is None:
+            self.print_error('No valid LVs provided')
+            return self.exit_code
+
         t0 = archive_ts_now()
         t0_monotonic = time.monotonic()
         logger.info('Creating archive at "%s"' % args.location.processed)
@@ -37,7 +59,7 @@ class ThinMixIn:
             cache=cache,
             create=True,
             progress=args.progress,
-            chunker_params=('thinlv',), # TODO: is this legal? the chunk size might vary between thin pools...
+            chunker_params=('fixed',chunk_size),
             start=t0,
             start_monotonic=t0_monotonic,
             log_json=args.log_json,
@@ -56,6 +78,7 @@ class ThinMixIn:
             archive=archive,
             cache=cache,
             add_item=archive.add_item,
+            chunk_size=chunk_size,
             process_file_chunks=cp.process_file_chunks,
             show_progress=args.progress,
             log_json=args.log_json,
