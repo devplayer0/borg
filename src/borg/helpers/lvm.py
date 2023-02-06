@@ -42,8 +42,8 @@ def create(name, *params):
 def rename(vg, old, new):
     subprocess.check_call(['lvrename', '-qq', vg, old, new])
 
-def remove(vg, lv):
-    subprocess.check_call(['lvremove', '-qq', '-y', f'{vg}/{lv}'])
+def remove(uuid):
+    subprocess.check_call(['lvremove', '-qq', '-y', '--select', f'lv_uuid={uuid}'])
 
 class Delta:
     Type = Enum('DeltaType', ['LEFT_ONLY', 'RIGHT_ONLY', 'DIFFERENT', 'SAME'])

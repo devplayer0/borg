@@ -36,7 +36,6 @@ class ThinMixIn:
             args.name,
             cache=cache,
             create=True,
-            checkpoint_interval=args.checkpoint_interval,
             progress=args.progress,
             chunker_params=('thinlv',), # TODO: is this legal? the chunk size might vary between thin pools...
             start=t0,
@@ -47,8 +46,10 @@ class ThinMixIn:
             cache=cache,
             key=manifest.key,
             add_item=archive.add_item,
+            prepare_checkpoint=archive.prepare_checkpoint,
             write_checkpoint=archive.write_checkpoint,
             checkpoint_interval=args.checkpoint_interval,
+            checkpoint_volume=args.checkpoint_volume,
             rechunkify=False,
         )
         top = ThinObjectProcessors(
@@ -68,7 +69,7 @@ class ThinMixIn:
             except (BackupOSError, BackupError) as e:
                 self.print_warning('%s/%s: %s', vg, lv, e)
                 status = 'E'
-            self.print_file_status(f'{vg}/{lv}', status)
+            self.print_file_status(status, f'{vg}/{lv}')
             if status is not None:
                 top.stats.files_stats[status] += 1
 
@@ -158,6 +159,14 @@ class ThinMixIn:
             default=1800,
             metavar="SECONDS",
             help="write checkpoint every SECONDS seconds (Default: 1800)",
+        )
+        archive_group.add_argument(
+            "--checkpoint-volume",
+            metavar="BYTES",
+            dest="checkpoint_volume",
+            type=int,
+            default=0,
+            help="write checkpoint every BYTES bytes (Default: 0, meaning no volume based checkpointing)",
         )
         archive_group.add_argument(
             "-C",

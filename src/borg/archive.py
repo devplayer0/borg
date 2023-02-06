@@ -1684,26 +1684,6 @@ class ThinObjectProcessors:
 
         self.stats = Statistics(output_json=log_json, iec=iec)  # threading: done by cache (including progress)
 
-    @contextmanager
-    def next_snap(self, *, vg, lv):
-        archive_name_clean = base64.b64encode(self.archive.name.encode('utf-8')).decode('ascii')
-        name = f'{lv}_next'
-        lvm.create(
-            name,
-            '-pr', # read-only
-            '-kn', # no activation skip
-            '-ay', # activate now
-            f'--addtag=borgarch-{archive_name_clean}',
-            '--snapshot', f'{vg}/{lv}')
-
-        try:
-            yield name
-        except:
-            lvm.remove(vg, name)
-            raise
-
-        lvm.rename(vg, name, f'{lv}_last')
-
     @classmethod
     def _chunkmap_for_delta(cls, *, total_chunks, delta):
         """A bit like an fmap, but really just filling in the gaps in the LVM delta info"""
@@ -1744,80 +1724,137 @@ class ThinObjectProcessors:
                     case 'old':
                         yield old_chunks[start + i]
 
+    @contextmanager
+    def next_snap(self, *, vg, lv):
+        archive_name_clean = base64.b64encode(self.archive.name.encode('utf-8')).decode('ascii')
+        name = f'{lv}_next'
+        logger.debug(f'creating next snap {vg}/{name}')
+        lvm.create(
+            name,
+            '-pr', # read-only
+            '-kn', # no activation skip
+            '-ay', # activate now
+            f'--addtag=borgarch-{archive_name_clean}',
+            '--snapshot', f'{vg}/{lv}')
+        info = lvm.get_lvs(f'{vg}/{name}')[0]
+
+        try:
+            yield info
+        except:
+            lvm.remove(info['lv_uuid'])
+            raise
+
+        lvm.rename(vg, name, f'{lv}_last')
+
+    @contextmanager
+    def consume_oldsnap(self, *, vg, lv, meta_path, nextsnap_info):
+        lv_qual = f'{vg}/{lv}'
+        lv_lastsnap_name = f'{lv}_last'
+        lv_lastsnap_qual = f'{vg}/{lv_lastsnap_name}'
+        lvs = lvm.get_lvs(select=f'lv_full_name={lv_lastsnap_qual}')
+
+        if not lvs:
+            yield None, None
+            return
+
+        lastsnap_info = lvs[0]
+        if 'borgthin' not in lastsnap_info['lv_tags']:
+            logger.warning(f'{lv_lastsnap_qual} is not an older borgthin snapshot')
+            yield None, None
+            return
+
+        for tag in lastsnap_info['lv_tags']:
+            m = self.snap_archname_re.match(tag)
+            if m:
+                last_arch_name = base64.b64decode(m.group(1)).decode('utf-8')
+                break
+        else:
+            logger.warning(f'Old snapshot {lv_lastsnap_qual} is missing a borgarch tag')
+            yield None, None
+            return
+
+        logger.debug(f"loading old archive '{last_arch_name}' for {lv_qual}")
+        last_archive = Archive(self.archive.manifest, last_arch_name, cache=self.cache)
+        try:
+            last_item = next(last_archive.iter_items(filter=lambda i: i.path == lv_qual))
+        except StopIteration:
+            logger.warning(f"LV {lv_qual} not found in old archive '{last_arch_name}'")
+            yield None, None
+            return
+
+        if 'xattrs' not in last_item or b'snapshot_lv_uuid' not in last_item.xattrs:
+            logger.warning(f"Snapshot UUID is missing for LV {lv_qual} in old archive '{last_arch_name}'")
+            raise BackupError('sad')
+            yield None, None
+            return
+        if last_item.xattrs[b'snapshot_lv_uuid'].decode('ascii') != lastsnap_info['lv_uuid']:
+            logger.warning(
+                f"UUID of snapshot for LV {lv_qual} in old archive '{last_arch_name}' doesn't match"
+                f"(snapshot is {lastsnap_info['lv_uuid']}, archive has {last_item.xattrs['snapshot_lv_uuid']})")
+            yield None, None
+            return
+
+        logger.debug(f"calculating thin delta for {lastsnap_info['lv_full_name']} -> {nextsnap_info['lv_full_name']}")
+        delta = lvm.thin_delta(meta_path, lastsnap_info['thin_id'], nextsnap_info['thin_id'])
+        yield delta, last_item.chunks
+
+        lvm.remove(lastsnap_info['lv_uuid'])
+
     def process_lv(self, *, vg, lv):
         lv_qual = f'{vg}/{lv}'
-        info = lvm.get_lvs(lv_qual)[0]
+        lvs = lvm.get_lvs(lv_qual)
+        if not lvs:
+            raise BackupError(f'LV {lv_qual} not found')
+
+        info = lvs[0]
         if not info['pool_lv'] or info['segtype'] != 'thin':
-            raise BackupError('%s is not a thin LV', lv_qual)
+            raise BackupError(f'{lv_qual} is not a thin LV')
 
         pool_info = lvm.get_lvs(uuid=info['pool_lv_uuid'])[0]
         meta_info = lvm.get_lvs(uuid=pool_info['metadata_lv_uuid'])[0]
         chunker = ChunkerFixed(lvm.get_size(pool_info, 'chunk_size'), sparse=True)
 
-        with self.next_snap(vg=vg, lv=lv) as lv_nextsnap_name:
-            lv_nextsnap_qual = f'{vg}/{lv_nextsnap_name}'
-            nextsnap_info = lvm.get_lvs(lv_nextsnap_qual)[0]
+        with self.next_snap(vg=vg, lv=lv) as nextsnap_info:
             nextsnap_size = lvm.get_size(nextsnap_info, 'lv_size')
             assert nextsnap_size % chunker.block_size == 0
 
-            with OsOpen(path=nextsnap_info['lv_path'], flags=flags_special_follow) as fd:
-                t = int(time.time()) * 1000000000
-                item = Item(
-                    path=lv_qual, mode=0o100660,
-                    mtime=t, atime=t, ctime=t) # forcing regular file mode
+            with lvm.meta_snapshot(pool_info['lv_dm_path'] + '-tpool'):
+                with OsOpen(path=nextsnap_info['lv_path'], flags=flags_special_follow) as fd:
+                    t = int(time.time()) * 1000000000
+                    item = Item(
+                        path=lv_qual, mode=0o100660, # forcing regular file mode
+                        mtime=t, atime=t, ctime=t,
+                        xattrs=StableDict(snapshot_lv_uuid=nextsnap_info['lv_uuid'].encode('ascii')))
 
-                lv_lastsnap_name = f'{lv}_last'
-                lv_lastsnap_qual = f'{vg}/{lv_lastsnap_name}'
-                lvs = lvm.get_lvs(select=f'lv_full_name={lv_lastsnap_qual}')
-                lastsnap_info = lvs[0] if lvs else None
-                if lastsnap_info is not None:
-                    if 'borgthin' not in lastsnap_info['lv_tags']:
-                        raise BackupError(f'{lv_lastsnap_qual} is not an older borgthin snapshot')
-                    for tag in lastsnap_info['lv_tags']:
-                        m = self.snap_archname_re.match(tag)
-                        if m:
-                            last_arch_name = base64.b64decode(m.group(1)).decode('utf-8')
-                            break
-                    else:
-                        raise BackupError(f'Old snapshot {lv_lastsnap_qual} is missing a borgarch tag')
+                    with self.consume_oldsnap(
+                            vg=vg, lv=lv,
+                            meta_path=meta_info['lv_dm_path'],
+                            nextsnap_info=nextsnap_info) as (delta, old_chunks):
+                        if delta is None or old_chunks is None:
+                            logger.warning(f'Valid old archive for {lv_qual} not found, backing up from scratch')
+                            delta = lvm.thin_dump(meta_info['lv_dm_path'], nextsnap_info['thin_id'])
+                            old_chunks = []
 
-                    last_archive = Archive(self.archive.manifest, last_arch_name, cache=self.cache)
-                    try:
-                        last_item = next(last_archive.iter_items(filter=lambda i: i.path == lv_qual))
-                    except StopIteration:
-                        raise BackupError(f'LV {lv_qual} not found in old archive {last_arch_name}')
+                            status = 'A'
+                        else:
+                            status = 'M'
 
-                    with lvm.meta_snapshot(pool_info['lv_dm_path'] + '-tpool'):
-                        delta = list(lvm.thin_delta(meta_info['lv_dm_path'], lastsnap_info['thin_id'], nextsnap_info['thin_id']))
+                        chunk_iter = self.delta_chunkify(
+                            fd=fd, chunker=chunker,
+                            total_chunks=nextsnap_size // chunker.block_size, delta=delta, old_chunks=old_chunks)
 
-                    status = 'M'
-                    chunk_iter = self.delta_chunkify(
-                        fd=fd, chunker=chunker,
-                        total_chunks=nextsnap_size // chunker.block_size, delta=delta, old_chunks=last_item.chunks)
-                else:
-                    with lvm.meta_snapshot(pool_info['lv_dm_path'] + '-tpool'):
-                        delta = list(lvm.thin_dump(meta_info['lv_dm_path'], nextsnap_info['thin_id']))
+                        self.print_file_status(status, lv_qual)
+                        self.stats.files_stats[status] += 1
+                        with backup_io("read"):
+                            logger.debug(f'processing chunks for {lv_qual}')
+                            self.process_file_chunks(
+                                item, self.cache, self.stats, self.show_progress,
+                                backup_io_iter(chunk_iter))
 
-                    status = 'A'
-                    chunk_iter = self.delta_chunkify(
-                        fd=fd, chunker=chunker,
-                        total_chunks=nextsnap_size // chunker.block_size, delta=delta, old_chunks=[])
-                    #chunk_iter = chunker.chunkify(fh=fd)
-
-                self.print_file_status(status, lv_qual)
-                self.stats.files_stats[status] += 1
-                with backup_io("read"):
-                    self.process_file_chunks(
-                        item, self.cache, self.stats, self.show_progress,
-                        backup_io_iter(chunk_iter))
-
-                item.get_size(memorize=True)
-                self.stats.nfiles += 1
-                self.add_item(item, stats=self.stats)
-
-                if lastsnap_info is not None:
-                    lvm.remove(vg, lv_lastsnap_name)
-                return None
+                        item.get_size(memorize=True)
+                        self.stats.nfiles += 1
+                        self.add_item(item, stats=self.stats)
+                        return None
 
 def valid_msgpacked_dict(d, keys_serialized):
     """check if the data <d> looks like a msgpacked dict"""
