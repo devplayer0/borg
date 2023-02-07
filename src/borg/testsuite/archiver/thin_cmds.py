@@ -125,10 +125,18 @@ class CreateThinTestCase(BaseThinTestCase):
                 v.seek(4 * 1024 * 1024)
                 write_random_data(v)
 
+            # 1: try a simple backup of a new volume with some data allocated
             self.cmd(f'--repo={self.repository_location}', 'tcreate', 'myarch', thin['lv_full_name'])
             assert lvm.get_lvs(thin['lv_full_name'])
             assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
             assert lvm.get_lvs(thin['lv_full_name'] + '_last')
+
+            # 2: try a backup with more than one thin lv
+            thin2 = self.make_thin(vg, pool)
+            self.cmd(f'--repo={self.repository_location}', 'tcreate', 'myarch2', thin['lv_full_name'], thin2['lv_full_name'])
+            assert lvm.get_lvs(thin2['lv_full_name'])
+            assert not lvm.get_lvs(thin2['lv_full_name'] + '_next')
+            assert lvm.get_lvs(thin2['lv_full_name'] + '_last')
 
     def test_content(self):
         self.cmd(f'--repo={self.repository_location}', 'rcreate', RK_ENCRYPTION)
