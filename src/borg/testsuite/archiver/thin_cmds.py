@@ -1,7 +1,9 @@
 import string
 from contextlib import contextmanager
+import struct
 import hashlib
 import random
+import fcntl
 import os
 import os.path
 import subprocess
@@ -38,7 +40,12 @@ def write_random_data(f, size=2 * 1024 * 1024, keep=False):
         return data_all, h.hexdigest()
     return h.hexdigest()
 
-def get_sum(f, size):
+def get_sum(f, size=None):
+    if size is None:
+        pos = f.tell()
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(pos, os.SEEK_SET)
     assert size % block_size == 0
 
     h = hashlib.sha256()
@@ -48,7 +55,18 @@ def get_sum(f, size):
 
     return h.hexdigest()
 
+IOCTL_BLKDISCARD = 0x1277
+def ioctl(fd, req, fmt, *args):
+    buf = struct.pack(fmt, *(args or [0]))
+    buf = fcntl.ioctl(fd, req, buf)
+    return struct.unpack(fmt, buf)[0]
+
+def discard_chunk(fd, offset, size):
+    ioctl(fd, IOCTL_BLKDISCARD, 'LL', offset, size)
+
 class BaseThinTestCase(ArchiverTestCaseBase):
+    chunk_size = 64 * 1024
+
     @contextmanager
     def make_vg(self, *args, size=512 * 1024 * 1024):
         id_ = make_id()
@@ -74,13 +92,24 @@ class BaseThinTestCase(ArchiverTestCaseBase):
 
     def make_tpool(self, vg, size='256M'):
         name = f'tpool-{make_id()}'
-        lvm.create(name, '--type', 'thin-pool', '-Zn', '-L', size, vg)
+        lvm.create(
+            name, '--type', 'thin-pool',
+            # using nopassdown should allow processing of discards independent of underlying medium
+            '-Zn', '--chunksize', f'{self.chunk_size}B', '--discards', 'nopassdown',
+            '-L', size, vg)
         return name
 
     def make_thin(self, vg, pool, size='128M'):
         name = f'thin-{make_id()}'
         lvm.create(name, '-V', size, '--thinpool', pool, vg)
         return lvm.get_lvs(f'{vg}/{name}')[0]
+
+    def check_backup_sum(self, thin, arch, sum_):
+        with changedir(self.output_path):
+            self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', '--noxattrs', arch)
+            with open(thin['lv_full_name'], 'rb') as f:
+                assert get_sum(f) == sum_
+            os.unlink(thin['lv_full_name'])
 
 class CreateThinTestCase(BaseThinTestCase):
     def test_basic(self):
@@ -106,13 +135,13 @@ class CreateThinTestCase(BaseThinTestCase):
             pool = self.make_tpool(vg)
             thin = self.make_thin(vg, pool, size='32M')
 
-            whole_size = 32 * 1024 * 1024
+            # 1: check the vol is backed up correctly from scratch
             with open(thin['lv_path'], 'r+b') as v:
                 v.seek(4 * 1024 * 1024)
-                data, data_sum = write_random_data(v, keep=True)
+                data_sum = write_random_data(v)
 
                 v.seek(0)
-                whole_sum = get_sum(v, whole_size)
+                whole_sum = get_sum(v)
                 print(whole_sum)
 
             output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'first', thin['lv_full_name'])
@@ -121,14 +150,9 @@ class CreateThinTestCase(BaseThinTestCase):
             assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
             assert lvm.get_lvs(thin['lv_full_name'] + '_last')
 
-            with changedir(self.output_path):
-                self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', '--noxattrs', 'first')
-                with open(thin['lv_full_name'], 'rb') as f:
-                    assert get_sum(f, whole_size) == whole_sum
+            self.check_backup_sum(thin, 'first', whole_sum)
 
-                os.unlink(thin['lv_full_name'])
-
-
+            # 2: check the vol is backed up correctly with a delta in new and unallocated areas
             with open(thin['lv_path'], 'r+b') as v:
                 v.seek(4 * 1024 * 1024 + 2048)
                 change = b'blahblahblah'
@@ -138,7 +162,8 @@ class CreateThinTestCase(BaseThinTestCase):
                 v.write(change)
 
                 v.seek(0)
-                whole_sum2 = get_sum(v, whole_size)
+                whole_sum2 = get_sum(v)
+                assert whole_sum2 != whole_sum
                 print(whole_sum2)
 
             output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'second', thin['lv_full_name'])
@@ -147,7 +172,17 @@ class CreateThinTestCase(BaseThinTestCase):
             assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
             assert lvm.get_lvs(thin['lv_full_name'] + '_last')
 
-            with changedir(self.output_path):
-                self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', '--noxattrs', 'second')
-                with open(thin['lv_full_name'], 'rb') as f:
-                    assert get_sum(f, whole_size) == whole_sum2
+            self.check_backup_sum(thin, 'second', whole_sum2)
+
+            # 3: check the vol is backed up correctly with a discard in a previously allocated area
+            with open(thin['lv_path'], 'r+b') as v:
+                discard_chunk(v.fileno(), 4 * 1024 * 1024 + 65536, self.chunk_size)
+
+                whole_sum3 = get_sum(v)
+                assert whole_sum3 != whole_sum2
+                print(whole_sum3)
+
+            output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'third', thin['lv_full_name'])
+            assert 'backing up from scratch' not in output
+
+            self.check_backup_sum(thin, 'third', whole_sum3)

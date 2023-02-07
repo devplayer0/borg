@@ -1711,6 +1711,7 @@ class ThinObjectProcessors:
             # account for hole at the end
             yield (i, total_chunks - i, 'hole')
 
+    # TODO: consider using variable size chunks for holes, chunker_params will be wrong but they are only used for rechunking
     def delta_chunkify(self, *, fd, total_chunks, delta, old_chunks):
         chunkmap = list(self._chunkmap_for_delta(total_chunks=total_chunks, delta=delta))
         fmap = [(start*self.chunker.block_size, length*self.chunker.block_size, t == 'new') for start, length, t in chunkmap]
