@@ -8,7 +8,9 @@ def get_size(info, k):
     return int(info[k][:-1])
 
 def get_lvs(spec=None, select=None, uuid=None):
-    cmd = ['lvs', '-a', '-olv_all,seg_all', '--units=b', '--reportformat', 'json_std']
+    # it would be nice to use json_std (to get proper ints and arrays), but
+    # older lvm tools don't support it
+    cmd = ['lvs', '-a', '-olv_all,seg_all', '--units=b', '--reportformat', 'json']
 
     if spec is not None:
         cmd.append(spec)

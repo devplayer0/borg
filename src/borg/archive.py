@@ -1769,12 +1769,13 @@ class ThinObjectProcessors:
             return
 
         lastsnap_info = lvs[0]
-        if 'borgthin' not in lastsnap_info['lv_tags']:
+        lastsnap_tags = lastsnap_info['lv_tags'].split(',')
+        if 'borgthin' not in lastsnap_tags:
             logger.warning(f'{lv_lastsnap_qual} is not an older borgthin snapshot')
             yield None, None
             return
 
-        for tag in lastsnap_info['lv_tags']:
+        for tag in lastsnap_tags:
             m = self.snap_archname_re.match(tag)
             if m:
                 last_arch_name = base64.b64decode(m.group(1)).decode('utf-8')
@@ -1806,7 +1807,7 @@ class ThinObjectProcessors:
             return
 
         logger.debug(f"calculating thin delta for {lastsnap_info['lv_full_name']} -> {nextsnap_info['lv_full_name']}")
-        delta = lvm.thin_delta(meta_path, lastsnap_info['thin_id'], nextsnap_info['thin_id'])
+        delta = lvm.thin_delta(meta_path, int(lastsnap_info['thin_id']), int(nextsnap_info['thin_id']))
         yield delta, last_item.chunks
 
         lvm.remove(lastsnap_info['lv_uuid'])
@@ -1843,7 +1844,7 @@ class ThinObjectProcessors:
                             nextsnap_info=nextsnap_info) as (delta, old_chunks):
                         if delta is None or old_chunks is None:
                             logger.warning(f'Valid old archive for {lv_qual} not found, backing up from scratch')
-                            delta = lvm.thin_dump(meta_info['lv_dm_path'], nextsnap_info['thin_id'])
+                            delta = lvm.thin_dump(meta_info['lv_dm_path'], int(nextsnap_info['thin_id']))
                             old_chunks = []
 
                             status = 'A'
