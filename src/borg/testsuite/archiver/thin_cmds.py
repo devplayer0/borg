@@ -104,10 +104,12 @@ class BaseThinTestCase(ArchiverTestCaseBase):
         lvm.create(name, '-V', size, '--thinpool', pool, vg)
         return lvm.get_lvs(f'{vg}/{name}')[0]
 
-    def check_backup_sum(self, thin, arch, sum_):
+    def check_backup_sum(self, thin, arch, sum_, hook=None):
         with changedir(self.output_path):
             self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', '--noxattrs', arch)
             with open(thin['lv_full_name'], 'rb') as f:
+                if hook is not None:
+                    hook(f)
                 assert get_sum(f) == sum_
             os.unlink(thin['lv_full_name'])
 
@@ -186,3 +188,63 @@ class CreateThinTestCase(BaseThinTestCase):
             assert 'backing up from scratch' not in output
 
             self.check_backup_sum(thin, 'third', whole_sum3)
+
+    def test_resize(self):
+        self.cmd(f'--repo={self.repository_location}', 'rcreate', RK_ENCRYPTION)
+
+        with self.make_vg() as vg:
+            pool = self.make_tpool(vg)
+            thin = self.make_thin(vg, pool, size='32M')
+
+            # 1: check the vol is backed up correctly from scratch
+            with open(thin['lv_path'], 'r+b') as v:
+                v.seek(6 * 1024 * 1024)
+                write_random_data(v)
+
+                v.seek(0)
+                whole_sum = get_sum(v)
+                print(whole_sum)
+
+            output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'first', thin['lv_full_name'])
+            assert 'backing up from scratch' in output
+
+            # 2: check the vol is backed up correctly with new data after growing
+            subprocess.check_call(['lvresize', '-L', '+4M', thin['lv_full_name']])
+
+            with open(thin['lv_path'], 'r+b') as v:
+                v.seek(33 * 1024 * 1024)
+                write_random_data(v, size=2*self.chunk_size)
+
+                v.seek(0)
+                whole_sum2 = get_sum(v)
+                assert whole_sum2 != whole_sum
+                print(whole_sum2)
+
+            output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'second', thin['lv_full_name'])
+            assert 'backing up from scratch' not in output
+
+            def check_size(size):
+                def hook(f):
+                    f.seek(0, os.SEEK_END)
+                    assert f.tell() == size
+                    f.seek(0)
+                return hook
+            self.check_backup_sum(thin, 'second', whole_sum2, hook=check_size(36 * 1024 * 1024))
+
+            # 3: check the vol is backed up correctly with new data after shrinking
+            subprocess.check_call(['lvresize', '-y', '-L', '-8M', thin['lv_full_name']])
+
+            with open(thin['lv_path'], 'r+b') as v:
+                v.seek(6 * 1024 * 1024 + 2048)
+                write_random_data(v, size=3*self.chunk_size)
+
+                v.seek(0)
+                whole_sum3 = get_sum(v)
+                assert whole_sum3 != whole_sum2
+                assert whole_sum3 != whole_sum
+                print(whole_sum3)
+
+            output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'third', thin['lv_full_name'])
+            assert 'backing up from scratch' not in output
+
+            self.check_backup_sum(thin, 'third', whole_sum3, hook=check_size(28 * 1024 * 1024))
