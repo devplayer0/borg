@@ -19,8 +19,14 @@ def get_lvs(spec=None, select=None, uuid=None):
     elif uuid is not None:
         cmd += ['--select', f'lv_uuid={uuid}']
 
-    output = subprocess.check_output(cmd)
-    return json.loads(output)['report'][0]['lv']
+    # pipe to /dev/null, seems like no amount of -q will silence errors
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if result.returncode == 5:
+        # this should be ok to allow in this case?
+        return []
+
+    result.check_returncode()
+    return json.loads(result.stdout)['report'][0]['lv']
 
 def reserve_meta_snapshot(path, activate=True):
     action = 'reserve' if activate else 'release'
