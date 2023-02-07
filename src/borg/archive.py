@@ -1718,6 +1718,15 @@ class ThinObjectProcessors:
         real_chunk_iter = self.chunker.chunkify(fh=fd, fmap=fmap)
         for (start, length, t) in chunkmap:
             for i in range(length):
+                # it seems that thin_{dump,delta} can report blocks beyond the size of the thin LV (when shrunk?)
+                # TODO: is this an upstream bug?
+                if start + i >= total_chunks:
+                    last_start, last_length, _ = chunkmap[-1]
+                    logger.debug(
+                        'thin metadata expands beyond the size of the new snapshot! '
+                        f'({last_start + last_length} > {total_chunks})')
+                    return
+
                 real_chunk = next(real_chunk_iter)
                 match t:
                     case 'hole' | 'new':
@@ -1824,7 +1833,7 @@ class ThinObjectProcessors:
                 with OsOpen(path=nextsnap_info['lv_path'], flags=flags_special_follow) as fd:
                     t = int(time.time()) * 1000000000
                     item = Item(
-                        path=lv_qual, mode=0o100660, # forcing regular file mode
+                        path=lv_qual, size=nextsnap_size, mode=0o100660, # forcing regular file mode
                         mtime=t, atime=t, ctime=t,
                         xattrs=StableDict(snapshot_lv_uuid=nextsnap_info['lv_uuid'].encode('ascii')))
 
@@ -1853,7 +1862,6 @@ class ThinObjectProcessors:
                                 item, self.cache, self.stats, self.show_progress,
                                 backup_io_iter(chunk_iter))
 
-                        item.get_size(memorize=True)
                         self.stats.nfiles += 1
                         self.add_item(item, stats=self.stats)
                         return None

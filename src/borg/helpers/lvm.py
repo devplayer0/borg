@@ -69,6 +69,9 @@ class Delta:
         self.begin = begin
         self.length = length
 
+    def __repr__(self):
+        return f'<{self.type} {self.begin} {self.length}>'
+
 def thin_delta(meta_path, thin1, thin2):
     cmd = ['thin_delta', '--metadata-snap', '--thin1', str(thin1), '--thin2', str(thin2), meta_path]
     output = subprocess.check_output(cmd)
