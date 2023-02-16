@@ -5,7 +5,7 @@ import re
 import stat
 import sys
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, namedtuple
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from functools import partial
@@ -20,7 +20,7 @@ from .logger import create_logger
 logger = create_logger()
 
 from . import xattr
-from .chunker import get_chunker, Chunk, ChunkerFixed
+from .chunker import get_chunker, Chunk
 from .cache import ChunkListEntry
 from .crypto.key import key_factory, UnsupportedPayloadError, AEADKeyBase
 from .compress import Compressor, CompressionSpec
@@ -1670,7 +1670,7 @@ class ThinObjectProcessors:
         cache,
         add_item,
         process_file_chunks,
-        chunk_size,
+        chunker_params,
         show_progress,
         log_json,
         iec,
@@ -1683,19 +1683,34 @@ class ThinObjectProcessors:
         self.show_progress = show_progress
         self.print_file_status = file_status_printer or (lambda *args: None)
 
-        self.chunker = ChunkerFixed(chunk_size, sparse=True)
+        self.chunker = get_chunker(*chunker_params, seed=archive.manifest.key.chunk_seed, sparse=True)
         self.stats = Statistics(output_json=log_json, iec=iec)  # threading: done by cache (including progress)
 
-    @classmethod
-    def _chunkmap_for_delta(cls, *, total_chunks, delta):
+    @staticmethod
+    def _segmap_for_delta(*, total_blocks, delta):
         """A bit like an fmap, but really just filling in the gaps in the LVM delta info"""
+        # TODO: possibly merge holes together
         i = 0
         for segment in delta:
+            # it seems that thin_{dump,delta} can report blocks beyond the size of the thin LV (when shrunk?)
+            # TODO: is this an upstream bug?
+            if segment.begin + segment.length > total_blocks:
+                logger.debug(
+                    'thin metadata expands beyond the size of the new snapshot! '
+                    f'({segment.begin + segment.length} > {total_blocks})')
+                length = total_blocks - segment.begin
+                if length <= 0:
+                    # segment is out in space beyond the proper end
+                    break
+            else:
+                length = segment.length
+
             if segment.begin - i > 0:
                 # hole between this and last block
                 yield (i, segment.begin - i, 'hole')
             else:
                 assert i == segment.begin
+
             match segment.type:
                 case lvm.Delta.Type.LEFT_ONLY:
                     # data -> hole
@@ -1704,36 +1719,238 @@ class ThinObjectProcessors:
                     t = 'old'
                 case lvm.Delta.Type.DIFFERENT | lvm.Delta.Type.RIGHT_ONLY:
                     t = 'new'
-            yield (segment.begin, segment.length, t)
-            i = segment.begin + segment.length
+            yield (segment.begin, length, t)
+            i = segment.begin + length
 
-        if total_chunks - i > 0:
+            if length != segment.length:
+                # segment truncated to end, let's get outta here
+                return
+
+        if total_blocks - i > 0:
             # account for hole at the end
-            yield (i, total_chunks - i, 'hole')
+            yield (i, total_blocks - i, 'hole')
 
-    # TODO: consider using variable size chunks for holes, chunker_params will be wrong but they are only used for rechunking
-    def delta_chunkify(self, *, fd, total_chunks, delta, old_chunks):
-        chunkmap = list(self._chunkmap_for_delta(total_chunks=total_chunks, delta=delta))
-        fmap = [(start*self.chunker.block_size, length*self.chunker.block_size, t == 'new') for start, length, t in chunkmap]
-        real_chunk_iter = self.chunker.chunkify(fh=fd, fmap=fmap)
-        for (start, length, t) in chunkmap:
-            for i in range(length):
-                # it seems that thin_{dump,delta} can report blocks beyond the size of the thin LV (when shrunk?)
-                # TODO: is this an upstream bug?
-                if start + i >= total_chunks:
-                    last_start, last_length, _ = chunkmap[-1]
-                    logger.debug(
-                        'thin metadata expands beyond the size of the new snapshot! '
-                        f'({last_start + last_length} > {total_chunks})')
-                    return
+    class DenseDeltaFile:
+        def __init__(self, *, segmap, block_size, fd):
+            self.segmap = segmap
+            self.block_size = block_size
+            self.fd = fd
 
-                real_chunk = next(real_chunk_iter)
-                match t:
-                    case 'hole' | 'new':
-                        # with our fmap we've ensured this will either be a hole or read from disk
-                        yield real_chunk
-                    case 'old':
-                        yield old_chunks[start + i]
+            self.pos = -1
+            self._advance()
+
+        def _advance(self):
+            self.pos += 1
+            self.offset = 0
+            if self.pos == len(self.segmap):
+                return
+
+            if self.segmap[self.pos][2] == 'new':
+                os.lseek(self.fd, self.segmap[self.pos][0]*self.block_size, os.SEEK_SET)
+            else:
+                self._advance()
+
+        def read(self, n):
+            if self.pos == len(self.segmap):
+                return bytes()
+
+            begin, length, _ = self.segmap[self.pos]
+            f_pos = begin * self.block_size
+            seg_size = length * self.block_size
+            to_read = min(n, seg_size - self.offset)
+
+            data = os.read(self.fd, to_read)
+            assert len(data) == to_read
+            self.offset += to_read
+            if to_read < n:
+                self._advance()
+                return data + self.read(n - to_read)
+            return data
+
+    @staticmethod
+    def _new_chunks_align(*, segmap, block_size, chunk_iter):
+        # leftover data from a potential partially-consumed chunk
+        leftover = None
+        for (_, length, t) in segmap:
+            if t != 'new':
+                continue
+
+            seg_pos = 0
+            seg_size = length * block_size
+            while seg_pos < seg_size:
+                #print(f'{seg_pos}/{seg_size}')
+                chunk = leftover if leftover is not None else next(chunk_iter)
+                chunk_size = chunk.meta['size']
+                if chunk_size <= seg_size - seg_pos:
+                    # this chunk fits inside what's left of the segment, we don't need to touch it
+                    yield chunk
+                    seg_pos += chunk_size
+                    leftover = None
+                else:
+                    # chunk is too big, need to chop it up
+                    start_size = seg_size - seg_pos
+                    start_data = None
+                    end_data = None
+                    if chunk.data is not None:
+                        start_data = chunk.data[:start_size]
+                        end_data = chunk.data[start_size:]
+                    yield Chunk(start_data, size=start_size, allocation=chunk.meta['allocation'])
+
+                    seg_pos += start_size
+                    leftover = Chunk(end_data, size=chunk_size - start_size, allocation=chunk.meta['allocation'])
+                assert seg_pos <= seg_size
+
+            # signal to the caller the segment is complete
+            yield None
+
+    def _old_chunks_filter_and_align(self, *, segmap, block_size, chunks):
+        LeftoverInfo = namedtuple('LeftoverInfo', 'id size offset')
+        ModChunkInfo = namedtuple('ModChunkInfo', 'id start end')
+
+        chunk_iter = enumerate(chunks)
+        # where we actually are in the chunk stream
+        chunk_stream_pos = 0
+        # info about leftover data from a potential partially-consumed chunk
+        leftover = None
+        # list of either whole ChunkListEntrys (to be passed through) and
+        # ModChunkInfos (to be fetched and processed)
+        aligned = []
+        # list of chunks we need to download in order to split them up
+        to_fetch = []
+        for (start, length, t) in segmap:
+            if t != 'old':
+                continue
+
+            #print(f'seg@{start} (size: {length})')
+            seg_pos = 0
+            seg_size = length * block_size
+            while seg_pos < seg_size:
+                seg_absolute = (start * block_size) + seg_pos
+                #print(f'map@{map_pos}:chunk_stream@{chunk_stream_pos} seg: {seg_pos}/{seg_size} leftover: {leftover}')
+                if leftover is not None:
+                    # if we have leftover, then we must be at the start of a segment -
+                    # otherwise we would have thrown the leftover away
+                    assert seg_pos == 0
+                    # `i` will be the same as last time
+                    chunk = leftover
+                else:
+                    i, chunk = next(chunk_iter)
+                #print(f'chunk {chunk.id} size: {chunk.size}')
+
+                # chek if the current absolute position in the segment falls within the range of the
+                # current (potentially leftover) chunk stream. chunk_stream_pos account for offset into
+                # the leftover chunk (and chunk.size holds the remainder of a leftover)
+                if seg_absolute not in range(chunk_stream_pos, chunk_stream_pos + chunk.size):
+                    # segment is ahead of the chunk stream
+                    # advance until the position within the segment is somewhere inside a chunk
+                    chunk_stream_pos += chunk.size
+                    # we can clear any possible leftover for sure at this point
+                    leftover = None
+                    continue
+
+                # how far into the chunk we are
+                c_start = seg_absolute - chunk_stream_pos
+                if leftover is not None:
+                    # if the chunk if a leftover, we include the offset.
+                    # c_start should tell us how far we are into the real underlying chunk.
+                    c_start += chunk.offset
+
+                real_size = chunks[i].size
+                # how far into the chunk we want to consume. if this chunk is big enough to fit the
+                # remainder of the segment, we choose that. otherwise, we cap at the end of the real
+                # underlying chunk (i.e. real_size).
+                c_end = min((seg_size - seg_pos) + c_start, real_size)
+
+                # at this point c_{start,end} are relative to the underlying real chunk's size
+                if c_start != 0 or c_end != real_size:
+                    # we aren't consuming a whole real chunk, so create some info that we can use to
+                    # later fetch and grab some data from.
+                    info = ModChunkInfo(id=chunk.id, start=c_start, end=c_end)
+
+                    # if there's some data left in this chunk we might want to consume it in the next segment
+                    remaining = real_size - c_end
+                    if remaining > 0:
+                        leftover = LeftoverInfo(id=chunk.id, size=remaining, offset=c_end)
+                    else:
+                        # nothing left, so clear the leftover
+                        leftover = None
+
+                    # store away this chunk's id so we can fetch it later (assuming it's not already queued up)
+                    if not to_fetch or to_fetch[-1] != chunk.id:
+                        to_fetch.append(chunk.id)
+                else:
+                    # consumed whole chunk (not a leftover), so we can keep the ChunkListEntry
+                    info = chunk
+
+                aligned.append(info)
+
+                # how much we ate from the underlying chunk
+                consumed = c_end - c_start
+                seg_pos += consumed
+
+                # how far we moved into the chunk
+                chunk_stream_pos += c_end
+                if isinstance(chunk, LeftoverInfo):
+                    # if we had a leftover, we should account for the fact that we started somewhere into the chunk
+                    chunk_stream_pos -= chunk.offset
+
+                assert seg_pos <= seg_size
+
+            # signal to the caller the segment is complete
+            aligned.append(None)
+
+        fetch_iter = self.archive.pipeline.fetch_many(to_fetch, is_preloaded=False)
+        last_id = None
+        data = None
+        for info in aligned:
+            if info is None or isinstance(info, ChunkListEntry):
+                # either the end of a segment or a whole chunk, just pass it through
+                yield info
+                continue
+
+            # we haven't downloaded this chunk yet
+            if last_id is None or info.id != last_id:
+                data = next(fetch_iter)
+                last_id = info.id
+            yield Chunk(data[info.start:info.end], size=info.end-info.start, allocation=CH_DATA)
+
+    @staticmethod
+    def _zeros_align(*, segmap, block_size):
+        for (_, length, t) in segmap:
+            if t != 'hole':
+                continue
+
+            seg_pos = 0
+            seg_size = length * block_size
+            while seg_pos < seg_size:
+                size = min(seg_size - seg_pos, len(zeros))
+                yield Chunk(None, size=size, allocation=CH_HOLE)
+                seg_pos += size
+
+            # signal to the caller the segment is complete
+            yield None
+
+    def delta_chunkify(self, *, fd, total_blocks, block_size, delta, old_chunks):
+        segmap = list(self._segmap_for_delta(total_blocks=total_blocks, delta=delta))
+
+        hole_iter = self._zeros_align(segmap=segmap, block_size=block_size)
+
+        fo = self.DenseDeltaFile(segmap=segmap, block_size=block_size, fd=fd)
+        new_chunk_iter = self._new_chunks_align(segmap=segmap, block_size=block_size, chunk_iter=self.chunker.chunkify(fo))
+
+        old_chunk_iter = self._old_chunks_filter_and_align(segmap=segmap, block_size=block_size, chunks=old_chunks)
+        for (_, _, t) in segmap:
+            #print(f'seg_{t},{b*block_size},{l*block_size}', file=f)
+            match t:
+                case 'hole':
+                    it = hole_iter
+                case 'new':
+                    it = new_chunk_iter
+                case 'old':
+                    it = old_chunk_iter
+
+            while chunk := next(it):
+                yield chunk
 
     @contextmanager
     def next_snap(self, *, vg, lv):
@@ -1823,12 +2040,12 @@ class ThinObjectProcessors:
             raise BackupError(f'{lv_qual} is not a thin LV')
 
         pool_info = lvm.get_lvs(uuid=info['pool_lv_uuid'])[0]
-        assert lvm.get_size(pool_info, 'chunk_size') == self.chunker.block_size
+        block_size = lvm.get_size(pool_info, 'chunk_size')
         meta_info = lvm.get_lvs(uuid=pool_info['metadata_lv_uuid'])[0]
 
         with self.next_snap(vg=vg, lv=lv) as nextsnap_info:
             nextsnap_size = lvm.get_size(nextsnap_info, 'lv_size')
-            assert nextsnap_size % self.chunker.block_size == 0
+            assert nextsnap_size % block_size == 0
 
             with lvm.meta_snapshot(pool_info['lv_dm_path'] + '-tpool'):
                 with OsOpen(path=nextsnap_info['lv_path'], flags=flags_special_follow) as fd:
@@ -1852,8 +2069,8 @@ class ThinObjectProcessors:
                             status = 'M'
 
                         chunk_iter = self.delta_chunkify(
-                            fd=fd, total_chunks=nextsnap_size // self.chunker.block_size,
-                            delta=delta, old_chunks=old_chunks)
+                            fd=fd, total_blocks=nextsnap_size // block_size,
+                            block_size=block_size, delta=delta, old_chunks=old_chunks)
 
                         self.print_file_status(status, lv_qual)
                         self.stats.files_stats[status] += 1

@@ -168,7 +168,7 @@ class CreateThinTestCase(BaseThinTestCase):
                 change = b'blahblahblah'
                 v.write(change)
 
-                v.seek(12 * 1024 * 1024)
+                v.seek(12 * 1024 * 1024 + 8192)
                 v.write(change)
 
                 v.seek(0)
