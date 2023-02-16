@@ -2016,7 +2016,6 @@ class ThinObjectProcessors:
 
         if 'xattrs' not in last_item or b'snapshot_lv_uuid' not in last_item.xattrs:
             logger.warning(f"Snapshot UUID is missing for LV {lv_qual} in old archive '{last_arch_name}'")
-            raise BackupError('sad')
             yield None, None
             return
         if last_item.xattrs[b'snapshot_lv_uuid'].decode('ascii') != lastsnap_info['lv_uuid']:
