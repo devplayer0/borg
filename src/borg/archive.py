@@ -1949,8 +1949,11 @@ class ThinObjectProcessors:
                 case 'old':
                     it = old_chunk_iter
 
+            started_chunking = time.monotonic()
             while chunk := next(it):
+                self.stats.chunking_time += time.monotonic() - started_chunking
                 yield chunk
+                started_chunking = time.monotonic()
 
     @contextmanager
     def next_snap(self, *, vg, lv):
