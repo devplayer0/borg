@@ -106,7 +106,7 @@ class BaseThinTestCase(ArchiverTestCaseBase):
 
     def check_backup_sum(self, thin, arch, sum_, hook=None):
         with changedir(self.output_path):
-            self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', '--noxattrs', arch)
+            self.cmd(f'--repo={self.repository_location}', 'extract', '--sparse', arch)
             with open(thin['lv_full_name'], 'rb') as f:
                 if hook is not None:
                     hook(f)

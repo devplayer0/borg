@@ -1662,6 +1662,30 @@ class TarfileObjectProcessors:
 
 class ThinObjectProcessors:
     snap_archname_re = re.compile(r'borgarch-(\S+)$')
+    meta_path = '.lv-meta.mpk'
+
+    class Metadata:
+        def __init__(self, internal_dict=None):
+            self._dict = internal_dict or {
+                'version': 1,
+                'vgs': {},
+            }
+
+        def add_lv(self, vg, lv, *, snapshot_uuid):
+            if vg not in self._dict:
+                self._dict['vgs'][vg] = {}
+            assert lv not in self._dict['vgs'][vg]
+            self._dict['vgs'][vg][lv] = {
+                'snapshot_uuid': snapshot_uuid,
+            }
+
+        def get_lv(self, vg, lv):
+            if vg not in self._dict['vgs']:
+                return None
+            return self._dict['vgs'][vg].get(lv)
+
+        def as_dict(self):
+            return StableDict(self._dict)
 
     def __init__(
         self,
@@ -1685,6 +1709,9 @@ class ThinObjectProcessors:
 
         self.chunker = get_chunker(*chunker_params, seed=archive.manifest.key.chunk_seed, sparse=True)
         self.stats = Statistics(output_json=log_json, iec=iec)  # threading: done by cache (including progress)
+
+        self.metadata = self.Metadata()
+        self._old_meta_cache = {}
 
     @staticmethod
     def _segmap_for_delta(*, total_blocks, delta):
@@ -2006,22 +2033,43 @@ class ThinObjectProcessors:
             return
 
         logger.debug(f"loading old archive '{last_arch_name}' for {lv_qual}")
-        last_archive = Archive(self.archive.manifest, last_arch_name, cache=self.cache)
         try:
-            last_item = next(last_archive.iter_items(filter=lambda i: i.path == lv_qual))
-        except StopIteration:
+            last_archive = Archive(self.archive.manifest, last_arch_name, cache=self.cache)
+        except Archive.DoesNotExist:
+            logger.warning(f"Old archive '{last_arch_name}' not found for LV {lv_qual}")
+            yield None, None
+            return
+
+        old_meta = self._old_meta_cache.get(last_arch_name)
+        last_item = None
+        for it in last_archive.iter_items(
+                preload=False,
+                filter=lambda i: i.path == lv_qual or (old_meta is None and i.path == self.meta_path)):
+            if it.path == self.meta_path:
+                up = msgpack.Unpacker(use_list=False)
+                for data in self.archive.pipeline.fetch_many([cle.id for cle in it.chunks], is_preloaded=False):
+                    up.feed(data)
+                self._old_meta_cache[last_arch_name] = old_meta = self.Metadata(internal_dict=next(up))
+            else:
+                last_item = it
+        if old_meta is None:
+            logger.warning(f"Thin metadata is missing from old archive '{last_arch_name}'")
+            yield None, None
+            return
+        if last_item is None:
             logger.warning(f"LV {lv_qual} not found in old archive '{last_arch_name}'")
             yield None, None
             return
 
-        if 'xattrs' not in last_item or b'snapshot_lv_uuid' not in last_item.xattrs:
-            logger.warning(f"Snapshot UUID is missing for LV {lv_qual} in old archive '{last_arch_name}'")
+        last_meta = old_meta.get_lv(vg, lv)
+        if last_meta is None:
+            logger.warning(f"Metadata is missing for LV {lv_qual} in old archive '{last_arch_name}'")
             yield None, None
             return
-        if last_item.xattrs[b'snapshot_lv_uuid'].decode('ascii') != lastsnap_info['lv_uuid']:
+        if last_meta['snapshot_uuid'] != lastsnap_info['lv_uuid']:
             logger.warning(
                 f"UUID of snapshot for LV {lv_qual} in old archive '{last_arch_name}' doesn't match"
-                f"(snapshot is {lastsnap_info['lv_uuid']}, archive has {last_item.xattrs['snapshot_lv_uuid']})")
+                f"(snapshot is {lastsnap_info['lv_uuid']}, archive has {last_meta['snapshot_uuid']})")
             yield None, None
             return
 
@@ -2054,8 +2102,8 @@ class ThinObjectProcessors:
                     t = int(time.time()) * 1000000000
                     item = Item(
                         path=lv_qual, size=nextsnap_size, mode=0o100660, # forcing regular file mode
-                        mtime=t, atime=t, ctime=t,
-                        xattrs=StableDict(snapshot_lv_uuid=nextsnap_info['lv_uuid'].encode('ascii')))
+                        mtime=t, atime=t, ctime=t)
+                    self.metadata.add_lv(vg, lv, snapshot_uuid=nextsnap_info['lv_uuid'])
 
                     with self.consume_oldsnap(
                             vg=vg, lv=lv,
@@ -2085,6 +2133,19 @@ class ThinObjectProcessors:
                         self.stats.nfiles += 1
                         self.add_item(item, stats=self.stats)
                         return None
+
+    def finalise(self):
+        data = msgpack.packb(self.metadata.as_dict())
+        assert len(data) <= MAX_DATA_SIZE
+        chunk = Chunk(data, size=len(data), allocation=CH_DATA)
+
+        t = int(time.time()) * 1000000000
+        meta_item = Item(
+            path=self.meta_path, size=chunk.meta['size'], mode=0o100660, # forcing regular file mode
+            mtime=t, atime=t, ctime=t)
+        self.process_file_chunks(meta_item, self.cache, self.stats, False, [chunk])
+
+        self.add_item(meta_item, show_progress=False)
 
 def valid_msgpacked_dict(d, keys_serialized):
     """check if the data <d> looks like a msgpacked dict"""

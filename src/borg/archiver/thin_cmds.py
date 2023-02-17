@@ -74,6 +74,7 @@ class ThinMixIn:
             self.print_file_status(status, f'{vg}/{lv}')
             if status is not None:
                 top.stats.files_stats[status] += 1
+        top.finalise()
 
         if args.progress:
             archive.stats.show_progress(final=True)
