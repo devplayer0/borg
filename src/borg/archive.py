@@ -3,6 +3,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import time
 from collections import OrderedDict, defaultdict, namedtuple
@@ -1982,12 +1983,22 @@ class ThinObjectProcessors:
                 yield chunk
                 started_chunking = time.monotonic()
 
+    @staticmethod
+    def wrap_lvm_call(task, fun, *args, **kwargs):
+        """Replace CalledProcessError with BackupError (so backup continues for other LVs)"""
+        try:
+            return fun(*args, **kwargs)
+        except subprocess.CalledProcessError as ex:
+            if ex.returncode != 5:
+                raise
+            raise BackupError(f'LVM {task} failed')
+
     @contextmanager
     def next_snap(self, *, vg, lv):
         archive_name_clean = base64.b64encode(self.archive.name.encode('utf-8')).decode('ascii')
         name = f'{lv}_next'
         logger.debug(f'creating next snap {vg}/{name}')
-        lvm.create(
+        self.wrap_lvm_call(f'create new backup snapshot {vg}/{name}', lvm.create,
             name,
             '-pr', # read-only
             '-kn', # no activation skip
@@ -2002,10 +2013,12 @@ class ThinObjectProcessors:
             lvm.remove(info['lv_uuid'])
             raise
 
-        lvm.rename(vg, name, f'{lv}_last')
+        self.wrap_lvm_call(
+            f'rename completed backup snapshot {vg}/{name} -> {vg}/{lv}_last', lvm.rename,
+            vg, name, f'{lv}_last')
 
     @contextmanager
-    def consume_oldsnap(self, *, vg, lv, meta_path, nextsnap_info):
+    def consume_oldsnap(self, *, vg, lv, thin_meta_path, nextsnap_info):
         lv_qual = f'{vg}/{lv}'
         lv_lastsnap_name = f'{lv}_last'
         lv_lastsnap_qual = f'{vg}/{lv_lastsnap_name}'
@@ -2074,10 +2087,14 @@ class ThinObjectProcessors:
             return
 
         logger.debug(f"calculating thin delta for {lastsnap_info['lv_full_name']} -> {nextsnap_info['lv_full_name']}")
-        delta = lvm.thin_delta(meta_path, int(lastsnap_info['thin_id']), int(nextsnap_info['thin_id']))
+        delta = self.wrap_lvm_call(
+            f'calculate delta from last snapshot {lv_lastsnap_qual}', lvm.thin_delta,
+            thin_meta_path, int(lastsnap_info['thin_id']), int(nextsnap_info['thin_id']))
         yield delta, last_item.chunks
 
-        lvm.remove(lastsnap_info['lv_uuid'])
+        self.wrap_lvm_call(
+            f'delete last snapshot {lv_lastsnap_qual}', lvm.remove,
+            lastsnap_info['lv_uuid'])
 
     def process_lv(self, *, vg, lv):
         lv_qual = f'{vg}/{lv}'
@@ -2107,11 +2124,13 @@ class ThinObjectProcessors:
 
                     with self.consume_oldsnap(
                             vg=vg, lv=lv,
-                            meta_path=meta_info['lv_dm_path'],
+                            thin_meta_path=meta_info['lv_dm_path'],
                             nextsnap_info=nextsnap_info) as (delta, old_chunks):
                         if delta is None or old_chunks is None:
                             logger.warning(f'Valid old archive for {lv_qual} not found, backing up from scratch')
-                            delta = lvm.thin_dump(meta_info['lv_dm_path'], int(nextsnap_info['thin_id']))
+                            delta = self.wrap_lvm_call(
+                                f"dump {nextsnap_info['lv_full_name']} thin metadata", lvm.thin_dump,
+                                meta_info['lv_dm_path'], int(nextsnap_info['thin_id']))
                             old_chunks = []
 
                             status = 'A'
