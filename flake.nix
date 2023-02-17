@@ -22,10 +22,10 @@
             name = "borgthin";
             version = "${version'}+${localVersion}";
             format = "pyproject";
-            preBuild = ''
-              echo "Version: ${version}" > PKG-INFO
-            '';
             src = ./.;
+
+            SETUPTOOLS_SCM_PRETEND_VERSION = version;
+
             nativeBuildInputs = (with python310Packages; [
               pkgconfig
               cython
@@ -39,10 +39,31 @@
               acl
             ];
             propagatedBuildInputs = (with python310Packages; [
-              (msgpack.overrideAttrs (old: { version = "1.0.4"; }))
+              (msgpack.overrideAttrs (final: prev: rec {
+                # Pin msgpack version for safety
+                name = "${prev.pname}-${final.version}";
+                version = "1.0.4";
+                src = fetchPypi {
+                  inherit (prev) pname;
+                  inherit version;
+                  hash = "sha256-9dhpwY8DAgLrQS8Iso0q/upVPWYTruieIA16yn7wH18";
+                };
+              }))
               packaging
               pyfuse3
               argon2-cffi
+              (platformdirs.overrideAttrs (final: prev: rec {
+                # TODO: remove this when nixpkgs updates platformdirs
+                name = "${prev.pname}-${final.version}";
+                version = "3.0.0";
+                SETUPTOOLS_SCM_PRETEND_VERSION = version;
+                src = fetchFromGitHub {
+                  owner = prev.pname;
+                  repo = prev.pname;
+                  rev = "refs/tags/${version}";
+                  hash = "sha256-RiZ26BGqS8nN5qHpUt7LIXSck/cGM8qlet3uL81TyPo";
+                };
+              }))
             ]);
 
             makeWrapperArgs = [
