@@ -1663,7 +1663,7 @@ class TarfileObjectProcessors:
 
 class ThinObjectProcessors:
     snap_archname_re = re.compile(r'borgarch-(\S+)$')
-    meta_path = '.lv-meta.mpk'
+    meta_path = '.lvm-meta.mpk'
 
     class Metadata:
         def __init__(self, internal_dict=None):
@@ -1693,7 +1693,7 @@ class ThinObjectProcessors:
         *,
         archive,
         cache,
-        add_item,
+        key,
         process_file_chunks,
         chunker_params,
         show_progress,
@@ -1703,12 +1703,12 @@ class ThinObjectProcessors:
     ):
         self.archive = archive
         self.cache = cache
-        self.add_item = add_item
+        self.key = key
         self.process_file_chunks = process_file_chunks
         self.show_progress = show_progress
         self.print_file_status = file_status_printer or (lambda *args: None)
 
-        self.chunker = get_chunker(*chunker_params, seed=archive.manifest.key.chunk_seed, sparse=True)
+        self.chunker = get_chunker(*chunker_params, seed=key.chunk_seed, sparse=True)
         self.stats = Statistics(output_json=log_json, iec=iec)  # threading: done by cache (including progress)
 
         self.metadata = self.Metadata()
@@ -1774,7 +1774,7 @@ class ThinObjectProcessors:
                 return
 
             if self.segmap[self.pos][2] == 'new':
-                os.lseek(self.fd, self.segmap[self.pos][0]*self.block_size, os.SEEK_SET)
+                os.lseek(self.fd, self.segmap[self.pos][0] * self.block_size, os.SEEK_SET)
             else:
                 self._advance()
 
@@ -2081,7 +2081,7 @@ class ThinObjectProcessors:
             return
         if last_meta['snapshot_uuid'] != lastsnap_info['lv_uuid']:
             logger.warning(
-                f"UUID of snapshot for LV {lv_qual} in old archive '{last_arch_name}' doesn't match"
+                f"UUID of snapshot for LV {lv_qual} in old archive '{last_arch_name}' doesn't match "
                 f"(snapshot is {lastsnap_info['lv_uuid']}, archive has {last_meta['snapshot_uuid']})")
             yield None, None
             return
@@ -2150,7 +2150,7 @@ class ThinObjectProcessors:
                                 backup_io_iter(chunk_iter))
 
                         self.stats.nfiles += 1
-                        self.add_item(item, stats=self.stats)
+                        self.archive.add_item(item, stats=self.stats)
                         return None
 
     def finalise(self):
@@ -2164,7 +2164,7 @@ class ThinObjectProcessors:
             mtime=t, atime=t, ctime=t)
         self.process_file_chunks(meta_item, self.cache, self.stats, False, [chunk])
 
-        self.add_item(meta_item, show_progress=False)
+        self.archive.add_item(meta_item, show_progress=False)
 
 def valid_msgpacked_dict(d, keys_serialized):
     """check if the data <d> looks like a msgpacked dict"""

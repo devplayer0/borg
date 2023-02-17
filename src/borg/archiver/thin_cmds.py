@@ -11,7 +11,6 @@ from ..helpers import archivename_validator, comment_validator, lv_validator, Ch
 from ..helpers import timestamp, archive_ts_now
 from ..helpers import basic_json_data, json_print
 from ..helpers import log_multi
-from ..helpers import lvm
 from ..helpers import sig_int
 from ..manifest import Manifest
 
@@ -30,7 +29,7 @@ class ThinMixIn:
 
         t0 = archive_ts_now()
         t0_monotonic = time.monotonic()
-        logger.info('Creating archive at "%s"' % args.location.processed)
+        logger.info(f'Creating archive at "{args.location.processed}"')
 
         archive = Archive(
             manifest,
@@ -56,7 +55,7 @@ class ThinMixIn:
         top = ThinObjectProcessors(
             archive=archive,
             cache=cache,
-            add_item=archive.add_item,
+            key=manifest.key,
             chunker_params=args.chunker_params,
             process_file_chunks=cp.process_file_chunks,
             show_progress=args.progress,
