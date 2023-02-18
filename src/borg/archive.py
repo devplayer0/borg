@@ -2134,21 +2134,28 @@ class ThinObjectProcessors:
                         else:
                             status = 'M'
 
-                        chunk_iter = self.delta_chunkify(
-                            fd=fd, total_blocks=nextsnap_size // block_size,
-                            block_size=block_size, delta=delta, old_chunks=old_chunks)
+                        try:
+                            chunk_iter = self.delta_chunkify(
+                                fd=fd, total_blocks=nextsnap_size // block_size,
+                                block_size=block_size, delta=delta, old_chunks=old_chunks)
 
-                        self.print_file_status(status, lv_qual)
-                        self.stats.files_stats[status] += 1
-                        with backup_io("read"):
-                            logger.debug(f'processing chunks for {lv_qual}')
-                            self.process_file_chunks(
-                                item, self.cache, self.stats, self.show_progress,
-                                backup_io_iter(chunk_iter))
+                            self.print_file_status(status, lv_qual)
+                            self.stats.files_stats[status] += 1
+                            with backup_io("read"):
+                                logger.debug(f'processing chunks for {lv_qual}')
+                                self.process_file_chunks(
+                                    item, self.cache, self.stats, self.show_progress,
+                                    backup_io_iter(chunk_iter))
 
-                        self.stats.nfiles += 1
-                        self.archive.add_item(item, stats=self.stats)
-                        return None
+                            self.stats.nfiles += 1
+                        except (BackupError, BackupOSError):
+                            # take care of potential orphaned chunks in a failure scenario
+                            for chunk in item.get("chunks", []):
+                                cache.chunk_decref(chunk.id, self.stats, wait=False)
+                            raise
+
+        self.archive.add_item(item, stats=self.stats)
+        return None
 
     def finalise(self):
         data = msgpack.packb(self.metadata.as_dict())
