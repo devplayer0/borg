@@ -1,5 +1,6 @@
 import string
 from contextlib import contextmanager
+import base64
 import struct
 import hashlib
 import random
@@ -20,6 +21,9 @@ from . import (
 
 def make_id():
     return ''.join(random.choice(string.ascii_letters) for _ in range(8))
+
+def ean(n):
+    return base64.b64encode(n.encode('utf-8')).decode('utf-8')
 
 block_size = 4096
 def write_random_data(f, size=2 * 1024 * 1024, keep=False):
@@ -128,15 +132,14 @@ class CreateThinTestCase(BaseThinTestCase):
             # 1: try a simple backup of a new volume with some data allocated
             self.cmd(f'--repo={self.repository_location}', 'tcreate', 'myarch', thin['lv_full_name'])
             assert lvm.get_lvs(thin['lv_full_name'])
-            assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
-            assert lvm.get_lvs(thin['lv_full_name'] + '_last')
+            assert len(lvm.get_lvs(select=f'origin="{thin["lv_name"]}" && tags={{"borgarch-{ean("myarch")}" && "borgthin-last"}}')) == 1
 
             # 2: try a backup with more than one thin lv
             thin2 = self.make_thin(vg, pool)
             self.cmd(f'--repo={self.repository_location}', 'tcreate', 'myarch2', thin['lv_full_name'], thin2['lv_full_name'])
             assert lvm.get_lvs(thin2['lv_full_name'])
-            assert not lvm.get_lvs(thin2['lv_full_name'] + '_next')
-            assert lvm.get_lvs(thin2['lv_full_name'] + '_last')
+            assert len(lvm.get_lvs(select=f'tags={{"borgarch-{ean("myarch2")}" && "borgthin-last"}}')) == 2
+            assert not lvm.get_lvs(select=f'tags="borgarch-{ean("myarch")}"')
 
     def test_content(self):
         self.cmd(f'--repo={self.repository_location}', 'rcreate', RK_ENCRYPTION)
@@ -157,8 +160,7 @@ class CreateThinTestCase(BaseThinTestCase):
             output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'first', thin['lv_full_name'])
             assert 'backing up from scratch' in output
             assert lvm.get_lvs(thin['lv_full_name'])
-            assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
-            assert lvm.get_lvs(thin['lv_full_name'] + '_last')
+            assert len(lvm.get_lvs(select=f'origin="{thin["lv_name"]}" && tags={{"borgarch-{ean("first")}" && "borgthin-last"}}')) == 1
 
             self.check_backup_sum(thin, 'first', whole_sum)
 
@@ -179,8 +181,8 @@ class CreateThinTestCase(BaseThinTestCase):
             output = self.cmd(f'--repo={self.repository_location}', '--debug', 'tcreate', 'second', thin['lv_full_name'])
             assert 'backing up from scratch' not in output
             assert lvm.get_lvs(thin['lv_full_name'])
-            assert not lvm.get_lvs(thin['lv_full_name'] + '_next')
-            assert lvm.get_lvs(thin['lv_full_name'] + '_last')
+            assert len(lvm.get_lvs(select=f'origin="{thin["lv_name"]}" && tags="borgthin-last"')) == 1
+            assert lvm.get_lvs(select=f'origin="{thin["lv_name"]}" && tags={{"borgarch-{ean("second")}" && "borgthin-last"}}')
 
             self.check_backup_sum(thin, 'second', whole_sum2)
 

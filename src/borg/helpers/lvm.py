@@ -10,7 +10,7 @@ def get_size(info, k):
 def get_lvs(spec=None, select=None, uuid=None):
     # it would be nice to use json_std (to get proper ints and arrays), but
     # older lvm tools don't support it
-    cmd = ['lvs', '-a', '-olv_all,seg_all', '--units=b', '--reportformat', 'json']
+    cmd = ['lvs', '-a', '-ovg_all,lv_all,seg_all', '--units=b', '--reportformat', 'json']
 
     if spec is not None:
         cmd.append(spec)
@@ -52,6 +52,11 @@ def rename(vg, old, new):
 
 def remove(uuid):
     subprocess.check_call(['lvremove', '-qq', '-y', '--select', f'lv_uuid={uuid}'])
+
+def change(uuid, *params):
+    cmd = ['lvchange', '-qq', '-y', '--select', f'lv_uuid={uuid}']
+    cmd += params
+    subprocess.check_call(cmd)
 
 class Delta:
     Type = Enum('DeltaType', ['LEFT_ONLY', 'RIGHT_ONLY', 'DIFFERENT', 'SAME'])

@@ -1669,21 +1669,17 @@ class ThinObjectProcessors:
         def __init__(self, internal_dict=None):
             self._dict = internal_dict or {
                 'version': 1,
-                'vgs': {},
+                'lvs': {},
             }
 
-        def add_lv(self, vg, lv, *, snapshot_uuid):
-            if vg not in self._dict:
-                self._dict['vgs'][vg] = {}
-            assert lv not in self._dict['vgs'][vg]
-            self._dict['vgs'][vg][lv] = {
+        def add_lv(self, lv_uuid, *, snapshot_uuid):
+            assert lv_uuid not in self._dict['lvs']
+            self._dict['lvs'][lv_uuid] = {
                 'snapshot_uuid': snapshot_uuid,
             }
 
-        def get_lv(self, vg, lv):
-            if vg not in self._dict['vgs']:
-                return None
-            return self._dict['vgs'][vg].get(lv)
+        def get_lv(self, lv_uuid):
+            return self._dict['lvs'].get(lv_uuid)
 
         def as_dict(self):
             return StableDict(self._dict)
@@ -1995,14 +1991,18 @@ class ThinObjectProcessors:
 
     @contextmanager
     def next_snap(self, *, vg, lv):
+        # https://github.com/lvmteam/lvm2/blob/b84a9927b78727efffbb257a61e9e95a648cdfab/lib/misc/lvm-string.c#L49
+        # tag charset: A-Za-z0-9._-+/=!:&# (aka fine for plain base64)
+        # seems length is unlimited?
         archive_name_clean = base64.b64encode(self.archive.name.encode('utf-8')).decode('ascii')
-        name = f'{lv}_next'
+        name = f'{lv}_{time.time_ns() // 1000 // 1000}' # time in ms suffix so it's unique (but still short)
         logger.debug(f'creating next snap {vg}/{name}')
         self.wrap_lvm_call(f'create new backup snapshot {vg}/{name}', lvm.create,
             name,
             '-pr', # read-only
             '-kn', # no activation skip
             '-ay', # activate now
+            f'--addtag=borgrepo-{self.archive.repository.id_str}', # id_str is a hex string
             f'--addtag=borgarch-{archive_name_clean}',
             '--snapshot', f'{vg}/{lv}')
         info = lvm.get_lvs(f'{vg}/{name}')[0]
@@ -2014,27 +2014,24 @@ class ThinObjectProcessors:
             raise
 
         self.wrap_lvm_call(
-            f'rename completed backup snapshot {vg}/{name} -> {vg}/{lv}_last', lvm.rename,
-            vg, name, f'{lv}_last')
+            f'mark new backup snapshot {vg}/{name} as completed', lvm.change,
+            info['lv_uuid'], '--addtag', 'borgthin-last')
 
     @contextmanager
-    def consume_oldsnap(self, *, vg, lv, thin_meta_path, nextsnap_info):
-        lv_qual = f'{vg}/{lv}'
-        lv_lastsnap_name = f'{lv}_last'
-        lv_lastsnap_qual = f'{vg}/{lv_lastsnap_name}'
-        lvs = lvm.get_lvs(select=f'lv_full_name={lv_lastsnap_qual}')
+    def consume_oldsnap(self, *, lv_info, thin_meta_path, nextsnap_info):
+        lv_qual = lv_info['lv_full_name']
 
+        lvs = lvm.get_lvs(
+            select=f'origin_uuid="{lv_info["lv_uuid"]}" && tags={{"borgrepo-{self.archive.repository.id_str}" && "borgthin-last"}}')
         if not lvs:
             yield None, None
             return
+        if len(lvs) != 1:
+            raise BackupError(f'Inconsistency detected: More than one valid snapshot exists for {lv_qual}')
 
         lastsnap_info = lvs[0]
         lastsnap_tags = lastsnap_info['lv_tags'].split(',')
-        if 'borgthin' not in lastsnap_tags:
-            logger.warning(f'{lv_lastsnap_qual} is not an older borgthin snapshot')
-            yield None, None
-            return
-
+        lv_lastsnap_qual = lastsnap_info['lv_full_name']
         for tag in lastsnap_tags:
             m = self.snap_archname_re.match(tag)
             if m:
@@ -2074,7 +2071,7 @@ class ThinObjectProcessors:
             yield None, None
             return
 
-        last_meta = old_meta.get_lv(vg, lv)
+        last_meta = old_meta.get_lv(lv_info['lv_uuid'])
         if last_meta is None:
             logger.warning(f"Metadata is missing for LV {lv_qual} in old archive '{last_arch_name}'")
             yield None, None
@@ -2120,10 +2117,10 @@ class ThinObjectProcessors:
                     item = Item(
                         path=lv_qual, size=nextsnap_size, mode=0o100660, # forcing regular file mode
                         mtime=t, atime=t, ctime=t)
-                    self.metadata.add_lv(vg, lv, snapshot_uuid=nextsnap_info['lv_uuid'])
+                    self.metadata.add_lv(info['lv_uuid'], snapshot_uuid=nextsnap_info['lv_uuid'])
 
                     with self.consume_oldsnap(
-                            vg=vg, lv=lv,
+                            lv_info=info,
                             thin_meta_path=meta_info['lv_dm_path'],
                             nextsnap_info=nextsnap_info) as (delta, old_chunks):
                         if delta is None or old_chunks is None:
