@@ -41,6 +41,7 @@ class ThinMixIn:
             start=t0,
             start_monotonic=t0_monotonic,
             log_json=args.log_json,
+            iec=args.iec,
         )
         cp = ChunksProcessor(
             cache=cache,
