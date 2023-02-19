@@ -814,15 +814,19 @@ Duration: {0.duration}
                     # as non-dry_run concerning fetching preloaded chunks from the pipeline or
                     # it would get stuck.
                     if "chunks" in item:
+                        fd = sys.stdout.fileno()
                         item_chunks_size = 0
                         for data in self.pipeline.fetch_many([c.id for c in item.chunks], is_preloaded=True):
                             if pi:
                                 pi.show(increase=len(data), info=[remove_surrogates(item.path)])
                             if stdout:
-                                sys.stdout.buffer.write(data)
+                                with backup_io("write"):
+                                    if sparse and zeros.startswith(data):
+                                        # all-zero chunk: create a hole in a sparse file
+                                        os.lseek(fd, len(data), os.SEEK_CUR)
+                                    else:
+                                        os.write(fd, data)
                             item_chunks_size += len(data)
-                        if stdout:
-                            sys.stdout.buffer.flush()
                         if "size" in item:
                             item_size = item.size
                             if item_size != item_chunks_size:
