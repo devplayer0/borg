@@ -1768,15 +1768,15 @@ class ThinObjectProcessors:
             self._advance()
 
         def _advance(self):
-            self.pos += 1
-            self.offset = 0
-            if self.pos == len(self.segmap):
-                return
+            while True:
+                self.pos += 1
+                self.offset = 0
+                if self.pos == len(self.segmap):
+                    break
 
-            if self.segmap[self.pos][2] == 'new':
-                os.lseek(self.fd, self.segmap[self.pos][0] * self.block_size, os.SEEK_SET)
-            else:
-                self._advance()
+                if self.segmap[self.pos][2] == 'new':
+                    os.lseek(self.fd, self.segmap[self.pos][0] * self.block_size, os.SEEK_SET)
+                    break
 
         def read(self, n):
             if self.pos == len(self.segmap):
