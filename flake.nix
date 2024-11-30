@@ -1,4 +1,5 @@
 {
+  # TODO/FIXME: Update this package to recent nixpkgs and borg
   description = "borg backup";
 
   inputs = {
@@ -39,16 +40,7 @@
               acl
             ];
             propagatedBuildInputs = (with python310Packages; [
-              (msgpack.overrideAttrs (final: prev: rec {
-                # Pin msgpack version for safety
-                name = "${prev.pname}-${final.version}";
-                version = "1.0.4";
-                src = fetchPypi {
-                  inherit (prev) pname;
-                  inherit version;
-                  hash = "sha256-9dhpwY8DAgLrQS8Iso0q/upVPWYTruieIA16yn7wH18";
-                };
-              }))
+              (callPackage ./py-msgpack.nix { })
               packaging
               pyfuse3
               argon2-cffi
